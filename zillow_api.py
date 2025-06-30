@@ -625,13 +625,12 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for deployment platforms"""
-        return JSONResponse(content={
+    return JSONResponse(content={
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "service": "Enhanced Zillow Property Scraper API",
         "version": "2.0.0",
-        }, status_code=200)
+    }, status_code=200)
     
 
 
