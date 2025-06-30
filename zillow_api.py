@@ -1,8 +1,8 @@
-
 """
-Zillow Property Scraper Simple API
-=================================
-A streamlined FastAPI for scraping Zillow property listings with JSON responses only.
+Enhanced Zillow Property Scraper API
+===================================
+A robust FastAPI for scraping Zillow property listings with advanced anti-detection
+and flexible search parameters.
 
 Requirements:
 - Python 3.7+
@@ -21,17 +21,18 @@ uvicorn zillow_api:app --host 0.0.0.0 --port 8000 --reload
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, validator
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Literal
 import httpx
 from lxml import html
 import asyncio
 import logging
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 import random
 from datetime import datetime
-import io
-import sys
+import json
+import base64
+import hashlib
 
 # Configure logging to capture HTTP requests and responses
 class LogCapture(logging.Handler):
@@ -74,9 +75,9 @@ httpx_logger.addHandler(log_capture)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Zillow Property Scraper API",
-    description="A simple REST API for scraping property listings from Zillow.com",
-    version="1.0.0",
+    title="Enhanced Zillow Property Scraper API",
+    description="A robust REST API for scraping property listings from Zillow.com with advanced search parameters",
+    version="2.0.0",
     docs_url="/docs"
 )
 
@@ -90,6 +91,9 @@ class PropertyData(BaseModel):
     square_feet: Optional[str] = None
     property_type: Optional[str] = None
     listing_url: Optional[str] = None
+    zestimate: Optional[str] = None
+    days_on_market: Optional[str] = None
+    listing_status: Optional[str] = None
 
 
 class SearchRequest(BaseModel):
@@ -101,6 +105,16 @@ class SearchRequest(BaseModel):
         le=200, 
         description="Maximum number of properties to scrape (1-200)"
     )
+    min_price: Optional[int] = Field(None, description="Minimum price filter")
+    max_price: Optional[int] = Field(None, description="Maximum price filter")
+    property_type: Optional[Literal["for_sale", "sold", "for_rent"]] = Field(
+        default="for_sale", 
+        description="Property listing type"
+    )
+    map_bounds: Optional[str] = Field(
+        None, 
+        description="Map bounds in format 'lat1,lng1,lat2,lng2' for geographic filtering"
+    )
     
     @validator('city')
     def validate_city(cls, v):
@@ -108,6 +122,20 @@ class SearchRequest(BaseModel):
         if not v or len(v.strip()) == 0:
             raise ValueError("City cannot be empty")
         return v.lower().replace(' ', '-').replace(',', '').strip()
+
+    @validator('map_bounds')
+    def validate_map_bounds(cls, v):
+        """Validate map bounds format"""
+        if v is None:
+            return v
+        try:
+            coords = v.split(',')
+            if len(coords) != 4:
+                raise ValueError("Map bounds must have 4 coordinates")
+            [float(coord) for coord in coords]  # Validate all are numbers
+            return v
+        except (ValueError, AttributeError):
+            raise ValueError("Map bounds must be in format 'lat1,lng1,lat2,lng2'")
 
 
 class SearchResponse(BaseModel):
@@ -119,15 +147,108 @@ class SearchResponse(BaseModel):
     scraping_time_seconds: float
     properties: List[PropertyData]
     message: str
+    search_url: Optional[str] = None
+
+
+class ZillowURLGenerator:
+    """Generate Zillow search URLs based on parameters"""
+    
+    @staticmethod
+    def generate_search_url(
+        city: str,
+        property_type: str = "for_sale",
+        min_price: Optional[int] = None,
+        max_price: Optional[int] = None,
+        map_bounds: Optional[str] = None,
+        page: int = 1
+    ) -> str:
+        """Generate Zillow search URL with all parameters"""
+        
+        # Base URL structure
+        base_url = f"https://www.zillow.com/{city}/"
+        
+        # Build search query state
+        search_state = {
+            "pagination": {"currentPage": page},
+            "usersSearchTerm": city.replace('-', ' ').title(),
+            "mapBounds": {},
+            "filterState": {}
+        }
+        
+        # Add property type filter
+        if property_type == "sold":
+            search_state["filterState"]["isRecentlySold"] = {"value": True}
+            search_state["filterState"]["isForSaleByAgent"] = {"value": False}
+            search_state["filterState"]["isForSaleByOwner"] = {"value": False}
+            search_state["filterState"]["isNewConstruction"] = {"value": False}
+            search_state["filterState"]["isComingSoon"] = {"value": False}
+            search_state["filterState"]["isAuction"] = {"value": False}
+            search_state["filterState"]["isForSaleForeclosure"] = {"value": False}
+        elif property_type == "for_rent":
+            search_state["filterState"]["isForRent"] = {"value": True}
+            search_state["filterState"]["isForSaleByAgent"] = {"value": False}
+            search_state["filterState"]["isForSaleByOwner"] = {"value": False}
+        else:  # for_sale (default)
+            search_state["filterState"]["isForSaleByAgent"] = {"value": True}
+            search_state["filterState"]["isForSaleByOwner"] = {"value": True}
+            search_state["filterState"]["isNewConstruction"] = {"value": False}
+            search_state["filterState"]["isComingSoon"] = {"value": False}
+            search_state["filterState"]["isAuction"] = {"value": False}
+            search_state["filterState"]["isForSaleForeclosure"] = {"value": False}
+        
+        # Add price filters
+        if min_price or max_price:
+            price_filter = {}
+            if min_price:
+                price_filter["min"] = min_price
+            if max_price:
+                price_filter["max"] = max_price
+            search_state["filterState"]["price"] = price_filter
+        
+        # Add map bounds if provided
+        if map_bounds:
+            coords = map_bounds.split(',')
+            search_state["mapBounds"] = {
+                "west": float(coords[1]),
+                "east": float(coords[3]),
+                "south": float(coords[0]),
+                "north": float(coords[2])
+            }
+        
+        # Convert to JSON and URL encode
+        search_query = json.dumps(search_state, separators=(',', ':'))
+        encoded_query = quote(search_query)
+        
+        # Build final URL
+        final_url = f"{base_url}?searchQueryState={encoded_query}"
+        
+        logger.info(f"Generated URL: {final_url}")
+        return final_url
 
 
 class ZillowScraper:
-    """Simplified Zillow scraper for API usage"""
+    """Enhanced Zillow scraper with anti-detection measures"""
     
     def __init__(self):
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        # Rotate user agents to avoid detection
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        ]
+        
+        self.url_generator = ZillowURLGenerator()
+        self.min_delay = 2
+        self.max_delay = 5
+        self.request_timeout = 30
+
+    def get_headers(self) -> Dict[str, str]:
+        """Get randomized headers for requests"""
+        return {
+            "User-Agent": random.choice(self.user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
@@ -136,51 +257,71 @@ class ZillowScraper:
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
             "Cache-Control": "max-age=0",
-            "Cookie": "zguid=24|%24fef1a295-9778-4650-adc4-24e2f3d36c7a; zjs_user_id=null; zjs_anonymous_id=%22fef1a295-9778-4650-adc4-24e2f3d36c7a%22"
-
+            "sec-ch-ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"'
         }
-        
-        self.min_delay = 1
-        self.max_delay = 3
-        self.request_timeout = 20
+
+    async def create_session(self) -> httpx.AsyncClient:
+        """Create HTTP session with enhanced configuration"""
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.request_timeout),
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+            headers=self.get_headers()
+        )
 
     async def fetch_page_content(self, url: str, session: httpx.AsyncClient) -> Optional[str]:
-        """Fetch HTML content from URL"""
-        max_retries = 2
+        """Fetch HTML content from URL with enhanced error handling"""
+        max_retries = 3
         
         for attempt in range(max_retries):
             try:
-                logger.info(f"Fetching URL: {url}")
+                logger.info(f"Attempt {attempt + 1}: Fetching URL: {url}")
                 
-                response = await session.get(
-                    url, 
-                    headers=self.headers,
-                    timeout=self.request_timeout,
-                    follow_redirects=True
-                )
+                # Update headers for each request
+                session.headers.update(self.get_headers())
+                
+                response = await session.get(url)
                 
                 logger.info(f"Response status: {response.status_code} for {url}")
                 
                 if response.status_code == 200:
+                    content_length = len(response.text)
+                    logger.info(f"Successfully fetched {content_length} characters")
                     return response.text
+                elif response.status_code == 403:
+                    logger.warning(f"403 Forbidden - Anti-bot detection triggered")
+                    wait_time = (attempt + 1) * 10
+                    await asyncio.sleep(wait_time)
                 elif response.status_code == 429:
-                    wait_time = (attempt + 1) * 5
+                    wait_time = (attempt + 1) * 15
                     logger.warning(f"Rate limited. Waiting {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
+                elif response.status_code == 404:
+                    logger.error(f"404 Not Found - Invalid URL or city: {url}")
+                    return None
                 else:
                     logger.warning(f"HTTP {response.status_code} for {url}")
                     
+            except httpx.TimeoutException:
+                logger.error(f"Timeout fetching {url}")
+            except httpx.ConnectError:
+                logger.error(f"Connection error fetching {url}")
             except Exception as e:
                 logger.error(f"Error fetching {url}: {str(e)}")
                 
             if attempt < max_retries - 1:
-                await asyncio.sleep(random.uniform(1, 3))
+                wait_time = random.uniform(3, 8)
+                logger.info(f"Waiting {wait_time:.2f} seconds before retry...")
+                await asyncio.sleep(wait_time)
                 
         return None
 
     def parse_property_details(self, card_element) -> Dict[str, Optional[str]]:
-        """Parse property card details"""
+        """Parse property card details with enhanced extraction"""
         property_data = {
             "address": None,
             "price": None,
@@ -188,53 +329,116 @@ class ZillowScraper:
             "bathrooms": None,
             "square_feet": None,
             "property_type": None,
-            "listing_url": None
+            "listing_url": None,
+            "zestimate": None,
+            "days_on_market": None,
+            "listing_status": None
         }
         
         try:
-            # Extract address
-            address_elements = card_element.xpath('.//address/text() | .//a/address/text()')
-            if address_elements:
-                property_data["address"] = address_elements[0].strip()
+            # Extract address - multiple selectors
+            address_selectors = [
+                './/address/text()',
+                './/a/address/text()',
+                './/*[@data-test="property-card-addr"]/text()',
+                './/*[contains(@class, "address")]/text()'
+            ]
             
-            # Extract price
-            price_elements = card_element.xpath('.//span[@data-test="property-card-price"]/text()')
-            if price_elements:
-                property_data["price"] = price_elements[0].strip()
+            for selector in address_selectors:
+                address_elements = card_element.xpath(selector)
+                if address_elements:
+                    property_data["address"] = address_elements[0].strip()
+                    break
+            
+            # Extract price - multiple selectors
+            price_selectors = [
+                './/span[@data-test="property-card-price"]/text()',
+                './/*[contains(@class, "price")]/text()',
+                './/*[contains(@data-test, "price")]/text()'
+            ]
+            
+            for selector in price_selectors:
+                price_elements = card_element.xpath(selector)
+                if price_elements:
+                    property_data["price"] = price_elements[0].strip()
+                    break
+            
+            # Extract Zestimate
+            zestimate_elements = card_element.xpath('.//*[contains(text(), "Zestimate")]/text()')
+            if zestimate_elements:
+                zestimate_text = zestimate_elements[0]
+                # Extract price from Zestimate text
+                import re
+                price_match = re.search(r'\$[\d,]+', zestimate_text)
+                if price_match:
+                    property_data["zestimate"] = price_match.group()
             
             # Extract property details
-            details_container = card_element.xpath('.//ul[contains(@class, "StyledPropertyCardHomeDetailsList")]')
+            details_selectors = [
+                './/ul[contains(@class, "StyledPropertyCardHomeDetailsList")]',
+                './/ul[contains(@class, "property-card-details")]',
+                './/*[contains(@class, "details")]'
+            ]
+            
+            details_container = None
+            for selector in details_selectors:
+                containers = card_element.xpath(selector)
+                if containers:
+                    details_container = containers[0]
+                    break
+            
             if details_container:
-                detail_items = details_container[0].xpath('.//li')
+                detail_items = details_container.xpath('.//li | .//span')
                 
                 for item in detail_items:
-                    text_content = ''.join(item.xpath('.//text()')).strip()
+                    text_content = ''.join(item.xpath('.//text()')).strip().lower()
                     
-                    if 'bd' in text_content.lower() or 'bed' in text_content.lower():
+                    if 'bd' in text_content or 'bed' in text_content:
                         beds = ''.join(filter(str.isdigit, text_content))
                         property_data["bedrooms"] = beds if beds else None
-                    elif 'ba' in text_content.lower() or 'bath' in text_content.lower():
+                    elif 'ba' in text_content or 'bath' in text_content:
                         baths = text_content.split()[0] if text_content.split() else None
                         property_data["bathrooms"] = baths
-                    elif 'sqft' in text_content.lower() or 'sq ft' in text_content.lower():
-                        sqft = ''.join(filter(lambda x: x.isdigit() or x == ',', text_content))
-                        property_data["square_feet"] = sqft.replace(',', '') if sqft else None
+                    elif 'sqft' in text_content or 'sq ft' in text_content:
+                        import re
+                        sqft_match = re.search(r'[\d,]+', text_content)
+                        if sqft_match:
+                            property_data["square_feet"] = sqft_match.group().replace(',', '')
+                    elif 'days on market' in text_content or 'dom' in text_content:
+                        days_match = re.search(r'\d+', text_content)
+                        if days_match:
+                            property_data["days_on_market"] = days_match.group()
             
             # Extract listing URL
-            link_elements = card_element.xpath('.//a[@data-test="property-card-link"]/@href')
-            if link_elements:
-                relative_url = link_elements[0]
-                property_data["listing_url"] = urljoin("https://www.zillow.com", relative_url)
+            link_selectors = [
+                './/a[@data-test="property-card-link"]/@href',
+                './/a[contains(@href, "/homedetails/")]/@href',
+                './/a[contains(@class, "property-card-link")]/@href'
+            ]
             
-            # Determine property type
+            for selector in link_selectors:
+                link_elements = card_element.xpath(selector)
+                if link_elements:
+                    relative_url = link_elements[0]
+                    property_data["listing_url"] = urljoin("https://www.zillow.com", relative_url)
+                    break
+            
+            # Determine property type from address
             if property_data["address"]:
                 address_lower = property_data["address"].lower()
                 if any(keyword in address_lower for keyword in ['apt', 'unit', '#']):
                     property_data["property_type"] = "Apartment"
                 elif any(keyword in address_lower for keyword in ['condo', 'condominium']):
                     property_data["property_type"] = "Condo"
+                elif any(keyword in address_lower for keyword in ['townhouse', 'townhome']):
+                    property_data["property_type"] = "Townhouse"
                 else:
                     property_data["property_type"] = "House"
+            
+            # Extract listing status
+            status_elements = card_element.xpath('.//*[contains(@class, "status") or contains(@class, "label")]/text()')
+            if status_elements:
+                property_data["listing_status"] = status_elements[0].strip()
                     
         except Exception as e:
             logger.warning(f"Error parsing property card: {str(e)}")
@@ -242,14 +446,17 @@ class ZillowScraper:
         return property_data
 
     async def scrape_properties_from_page(self, html_content: str) -> List[Dict]:
-        """Extract properties from HTML content"""
+        """Extract properties from HTML content with enhanced parsing"""
         try:
             tree = html.fromstring(html_content)
             
+            # Multiple selectors to find property cards
             property_selectors = [
                 '//li[contains(@class, "ListItem-c11n")]',
                 '//article[contains(@class, "property-card")]',
-                '//div[contains(@class, "property-card")]'
+                '//div[contains(@class, "property-card")]',
+                '//li[contains(@class, "result-list-item")]',
+                '//div[contains(@data-test, "property-card")]'
             ]
             
             property_cards = []
@@ -262,14 +469,26 @@ class ZillowScraper:
             
             if not property_cards:
                 logger.warning("No property cards found on page")
+                # Log page content for debugging
+                if len(html_content) < 1000:
+                    logger.debug(f"Page content: {html_content[:500]}...")
                 return []
             
             properties = []
-            for card in property_cards:
-                property_data = self.parse_property_details(card)
-                
-                if property_data["address"] and property_data["price"]:
-                    properties.append(property_data)
+            for i, card in enumerate(property_cards):
+                try:
+                    property_data = self.parse_property_details(card)
+                    
+                    # Only include properties with essential data
+                    if property_data["address"] and property_data["price"]:
+                        properties.append(property_data)
+                        logger.debug(f"Property {i+1}: {property_data['address']} - {property_data['price']}")
+                    else:
+                        logger.debug(f"Skipping property {i+1}: missing essential data")
+                        
+                except Exception as e:
+                    logger.warning(f"Error parsing property card {i+1}: {str(e)}")
+                    continue
             
             logger.info(f"Successfully parsed {len(properties)} valid properties")
             return properties
@@ -278,24 +497,44 @@ class ZillowScraper:
             logger.error(f"Error parsing HTML content: {str(e)}")
             return []
 
-    async def scrape_properties(self, city: str, max_properties: int) -> List[Dict]:
-        """Main scraping function"""
+    async def scrape_properties(
+        self,
+        city: str,
+        max_properties: int,
+        property_type: str = "for_sale",
+        min_price: Optional[int] = None,
+        max_price: Optional[int] = None,
+        map_bounds: Optional[str] = None
+    ) -> tuple[List[Dict], str]:
+        """Main scraping function with enhanced parameters"""
         start_time = time.time()
         logger.info(f"Starting scrape for {city} (max {max_properties} properties)")
+        logger.info(f"Filters - Type: {property_type}, Price: {min_price}-{max_price}, Bounds: {map_bounds}")
         
-        base_url = f"https://www.zillow.com/{city}/"
         scraped_properties = []
+        search_url = None
         
         try:
-            async with httpx.AsyncClient() as session:
+            async with await self.create_session() as session:
                 page_number = 1
                 consecutive_empty_pages = 0
                 max_empty_pages = 3
-                max_pages = 10  # Limit to prevent infinite loops
+                max_pages = 15  # Increased for better coverage
                 
                 while len(scraped_properties) < max_properties and page_number <= max_pages:
                     
-                    page_url = f"{base_url}?searchQueryState=%7B%22pagination%22%3A%7B%22currentPage%22%3A{page_number}%7D%7D"
+                    # Generate URL for current page
+                    page_url = self.url_generator.generate_search_url(
+                        city=city,
+                        property_type=property_type,
+                        min_price=min_price,
+                        max_price=max_price,
+                        map_bounds=map_bounds,
+                        page=page_number
+                    )
+                    
+                    if page_number == 1:
+                        search_url = page_url  # Store first page URL for response
                     
                     html_content = await self.fetch_page_content(page_url, session)
                     
@@ -328,7 +567,7 @@ class ZillowScraper:
                     
                     page_number += 1
                     
-                    # Rate limiting
+                    # Enhanced rate limiting with randomization
                     delay = random.uniform(self.min_delay, self.max_delay)
                     logger.info(f"Waiting {delay:.2f} seconds before next request...")
                     await asyncio.sleep(delay)
@@ -341,7 +580,7 @@ class ZillowScraper:
             scraping_time = end_time - start_time
             logger.info(f"Scraping completed in {scraping_time:.2f} seconds. Found {len(scraped_properties)} properties")
             
-            return scraped_properties
+            return scraped_properties, search_url
             
         except Exception as e:
             logger.error(f"Scraping failed: {str(e)}")
@@ -356,19 +595,30 @@ scraper = ZillowScraper()
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Zillow Property Scraper API",
-        "version": "1.0.0",
+        "message": "Enhanced Zillow Property Scraper API",
+        "version": "2.0.0",
         "status": "running",
+        "features": [
+            "Anti-detection measures for production deployment",
+            "Advanced search filters (price, type, map bounds)",
+            "Enhanced property data extraction",
+            "Robust error handling and retry logic"
+        ],
         "endpoints": {
             "GET /": "API information",
             "GET /search": "Search properties with query parameters",
             "POST /search": "Search properties with JSON body",
             "GET /logs": "View API logs",
+            "GET /health": "Health check",
             "GET /docs": "API documentation"
         },
-        "usage": {
-            "GET": "/search?city=miami-fl&max_properties=20",
-            "POST": "Body: {\"city\": \"miami-fl\", \"max_properties\": 20}"
+        "search_parameters": {
+            "city": "City slug (e.g., 'miami-fl')",
+            "max_properties": "Max properties to return (1-200)",
+            "min_price": "Minimum price filter",
+            "max_price": "Maximum price filter", 
+            "property_type": "Type: 'for_sale', 'sold', 'for_rent'",
+            "map_bounds": "Geographic bounds: 'lat1,lng1,lat2,lng2'"
         }
     }
 
@@ -379,13 +629,19 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "service": "Zillow Property Scraper API"
+        "service": "Enhanced Zillow Property Scraper API",
+        "version": "2.0.0"
     }
+
 
 @app.get("/search", response_model=SearchResponse)
 async def search_properties_get(
     city: str = Query(..., description="City to scrape (e.g., 'miami-fl', 'new-york-ny')"),
-    max_properties: int = Query(30, ge=1, le=200, description="Maximum properties to scrape (1-200)")
+    max_properties: int = Query(30, ge=1, le=200, description="Maximum properties to scrape (1-200)"),
+    min_price: Optional[int] = Query(None, description="Minimum price filter"),
+    max_price: Optional[int] = Query(None, description="Maximum price filter"),
+    property_type: Literal["for_sale", "sold", "for_rent"] = Query("for_sale", description="Property listing type"),
+    map_bounds: Optional[str] = Query(None, description="Map bounds: 'lat1,lng1,lat2,lng2'")
 ):
     """Search for properties using query parameters"""
     start_time = time.time()
@@ -393,10 +649,17 @@ async def search_properties_get(
     try:
         # Format city name
         formatted_city = city.lower().replace(' ', '-').replace(',', '').strip()
-        logger.info(f"GET /search - City: {formatted_city}, Max: {max_properties}")
+        logger.info(f"GET /search - City: {formatted_city}, Type: {property_type}, Max: {max_properties}")
         
         # Scrape properties
-        properties = await scraper.scrape_properties(formatted_city, max_properties)
+        properties, search_url = await scraper.scrape_properties(
+            city=formatted_city,
+            max_properties=max_properties,
+            property_type=property_type,
+            min_price=min_price,
+            max_price=max_price,
+            map_bounds=map_bounds
+        )
         
         scraping_time = time.time() - start_time
         
@@ -410,7 +673,8 @@ async def search_properties_get(
             properties_found=len(properties),
             scraping_time_seconds=round(scraping_time, 2),
             properties=property_objects,
-            message=f"Successfully scraped {len(properties)} properties from {formatted_city}"
+            message=f"Successfully scraped {len(properties)} properties from {formatted_city}",
+            search_url=search_url
         )
         
     except Exception as e:
@@ -434,10 +698,17 @@ async def search_properties_post(request: SearchRequest):
     start_time = time.time()
     
     try:
-        logger.info(f"POST /search - City: {request.city}, Max: {request.max_properties}")
+        logger.info(f"POST /search - City: {request.city}, Type: {request.property_type}, Max: {request.max_properties}")
         
         # Scrape properties
-        properties = await scraper.scrape_properties(request.city, request.max_properties)
+        properties, search_url = await scraper.scrape_properties(
+            city=request.city,
+            max_properties=request.max_properties,
+            property_type=request.property_type,
+            min_price=request.min_price,
+            max_price=request.max_price,
+            map_bounds=request.map_bounds
+        )
         
         scraping_time = time.time() - start_time
         
@@ -451,7 +722,8 @@ async def search_properties_post(request: SearchRequest):
             properties_found=len(properties),
             scraping_time_seconds=round(scraping_time, 2),
             properties=property_objects,
-            message=f"Successfully scraped {len(properties)} properties from {request.city}"
+            message=f"Successfully scraped {len(properties)} properties from {request.city}",
+            search_url=search_url
         )
         
     except Exception as e:
@@ -480,7 +752,43 @@ async def get_logs(limit: int = Query(100, ge=1, le=1000, description="Number of
         "logs": recent_logs
     }
 
-# The /docs endpoint is automatically created by FastAPI
+
+@app.get("/test-url")
+async def test_url_generation(
+    city: str = Query(..., description="City to test"),
+    property_type: Literal["for_sale", "sold", "for_rent"] = Query("for_sale"),
+    min_price: Optional[int] = Query(None),
+    max_price: Optional[int] = Query(None),
+    map_bounds: Optional[str] = Query(None)
+):
+    """Test URL generation without scraping"""
+    try:
+        url_generator = ZillowURLGenerator()
+        generated_url = url_generator.generate_search_url(
+            city=city,
+            property_type=property_type,
+            min_price=min_price,
+            max_price=max_price,
+            map_bounds=map_bounds
+        )
+        
+        return {
+            "success": True,
+            "city": city,
+            "parameters": {
+                "property_type": property_type,
+                "min_price": min_price,
+                "max_price": max_price,
+                "map_bounds": map_bounds
+            },
+            "generated_url": generated_url
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 
 if __name__ == "__main__":
     import uvicorn
